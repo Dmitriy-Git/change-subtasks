@@ -2,8 +2,11 @@
 """Разбор артефактов OpenSpec change в JSON. Только чтение, ничего не пишет.
 
 Использование:
-    python parse_change.py <change-id | путь-к-change>
-    python parse_change.py --list        # активные change в openspec/changes/
+    python parse_change.py <change-id | путь-к-change> [--root <корень репо>] [--save-baseline]
+    python parse_change.py --list [--root <корень репо>]   # активные change
+
+--save-baseline сохраняет sha256 артефактов во временный каталог системы
+(не в репозиторий); check_coverage.py сверяет с ними, какие файлы менялись.
 
 Выводит в stdout JSON: наличие файлов и их sha256, proposal, design, tasks,
 specs (Requirements и Scenarios по дельтам) и предупреждения (warnings)
@@ -14,6 +17,7 @@ import hashlib
 import json
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 DELTA_RE = re.compile(r"^##\s+(ADDED|MODIFIED|REMOVED|RENAMED)\s+Requirements\s*$", re.I)
@@ -21,7 +25,19 @@ FULL_RE = re.compile(r"^##\s+Requirements\s*$", re.I)
 H2_RE = re.compile(r"^##\s")
 REQ_RE = re.compile(r"^###\s+Requirement:\s*(.+?)\s*$")
 SCEN_RE = re.compile(r"^####\s+Scenario:\s*(.+?)\s*$")
-STEP_RE = re.compile(r"^\s*[-*]\s+\*{0,2}(GIVEN|WHEN|THEN|AND|BUT)\*{0,2}\s*(.*)$", re.I)
+STEP_KW = {
+    "GIVEN": "GIVEN", "WHEN": "WHEN", "THEN": "THEN", "AND": "AND", "BUT": "BUT",
+    "ДАНО": "GIVEN", "КОГДА": "WHEN", "ТОГДА": "THEN", "И": "AND", "НО": "BUT",
+}
+# Шаг сценария: маркер списка (-, *, 1., 1)) необязателен, ключевое слово
+# может быть выделено ** и заканчиваться двоеточием; русские ключевые слова тоже.
+STEP_RE = re.compile(
+    r"^\s*(?:[-*]|\d+[.)])?\s*\*{0,2}("
+    + "|".join(STEP_KW)
+    + r")\b\*{0,2}:?\*{0,2}\s*(.*)$",
+    re.I,
+)
+BREAKING_RE = re.compile(r"(?<![-\w])BREAKING\b")
 RENAME_RE = re.compile(
     r"^\s*[-*]\s*(FROM|TO)\s*:\s*`?(?:###\s*Requirement:\s*)?(.+?)`?\s*$", re.I
 )
@@ -29,7 +45,23 @@ HEAD_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 TASK_RE = re.compile(r"^\s*[-*]\s+\[( |x|X)\]\s+(.*)$")
 NUM_RE = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+(.*)$")
 OPEN_Q_RE = re.compile(r"open questions|открытые вопросы|нерешённые|нерешенные", re.I)
-LIST_ITEM_RE = re.compile(r"^\s*(?:[-*]|\d+\.)\s+(?:\[[ xX]\]\s+)?(.+)$")
+LIST_ITEM_RE = re.compile(r"^(\s*)(?:[-*]|\d+\.)\s+(?:\[[ xX]\]\s+)?(.+)$")
+
+ROOT = Path(".")
+
+
+def changes_base():
+    return ROOT / "openspec" / "changes"
+
+
+def baseline_path(change_dir):
+    """Файл с базовыми хэшами во временном каталоге системы (вне репозитория)."""
+    key = hashlib.sha256(str(Path(change_dir).resolve()).encode("utf-8")).hexdigest()[:16]
+    return Path(tempfile.gettempdir()) / "change-subtasks" / f"{Path(change_dir).name}-{key}.json"
+
+
+def file_hashes(parsed):
+    return {k: v["sha256"] for k, v in parsed["files"].items() if v["exists"] and k != "subtasks.md"}
 
 
 def sha256(path):
@@ -43,18 +75,20 @@ def read(path):
 def resolve_change(arg):
     """Вернуть Path каталога change по пути или id, иначе None."""
     p = Path(arg)
+    if not p.is_absolute():
+        p = ROOT / p
     if p.is_dir():
         return p
-    q = Path("openspec/changes") / arg
+    q = changes_base() / arg
     if q.is_dir():
         return q
     return None
 
 
 def list_changes():
-    base = Path("openspec/changes")
+    base = changes_base()
     if not base.is_dir():
-        return []
+        return None
     return sorted(
         d.name for d in base.iterdir() if d.is_dir() and d.name != "archive"
     )
@@ -115,7 +149,7 @@ def parse_specs(change_dir, warnings):
             sm = STEP_RE.match(line)
             if scen is not None and sm:
                 scen["steps"].append(
-                    {"kw": sm.group(1).upper(), "text": sm.group(2).strip()}
+                    {"kw": STEP_KW[sm.group(1).upper()], "text": sm.group(2).strip()}
                 )
                 continue
             if (
@@ -159,7 +193,7 @@ def parse_specs(change_dir, warnings):
 
 def parse_design(text):
     heads, open_q = [], []
-    oq_level = None
+    oq_level, oq_indent = None, None
     for n, line in enumerate(text.splitlines(), 1):
         m = HEAD_RE.match(line)
         if m:
@@ -168,12 +202,18 @@ def parse_design(text):
             if oq_level is not None and level <= oq_level:
                 oq_level = None
             if OPEN_Q_RE.search(title):
-                oq_level = level
+                oq_level, oq_indent = level, None
             continue
         if oq_level is not None:
             im = LIST_ITEM_RE.match(line)
             if im:
-                open_q.append({"text": im.group(1).strip(), "line": n})
+                indent = len(im.group(1).expandtabs(4))
+                if oq_indent is None or indent <= oq_indent:
+                    oq_indent = indent
+                    open_q.append({"text": im.group(2).strip(), "line": n})
+                elif open_q:
+                    # Вложенный пункт уточняет предыдущий вопрос, а не новый вопрос.
+                    open_q[-1]["text"] += " / " + im.group(2).strip()
     return {"headings": heads, "open_questions": open_q}
 
 
@@ -187,7 +227,7 @@ def parse_proposal(text):
             continue
         if cur is not None and line.strip():
             sections[cur].append(line.rstrip())
-        if "BREAKING" in line:
+        if BREAKING_RE.search(line):
             breaking.append({"line": n, "text": line.strip()})
     return {
         "sections": {k: "\n".join(v) for k, v in sections.items()},
@@ -282,13 +322,27 @@ def main():
     ap = argparse.ArgumentParser(description="Разбор артефактов OpenSpec change в JSON")
     ap.add_argument("change", nargs="?", help="id change или путь к каталогу")
     ap.add_argument("--list", action="store_true", help="показать активные change")
+    ap.add_argument("--root", default=".", help="корень репозитория (по умолчанию текущий каталог)")
+    ap.add_argument(
+        "--save-baseline",
+        action="store_true",
+        help="сохранить хэши артефактов во временный каталог для проверки в check_coverage.py",
+    )
     args = ap.parse_args()
+    global ROOT
+    ROOT = Path(args.root)
 
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
 
     if args.list:
-        for name in list_changes():
+        names = list_changes()
+        if names is None:
+            print(f"Каталог не найден: {changes_base()} (запустите из корня репозитория или укажите --root)", file=sys.stderr)
+            return 2
+        if not names:
+            print("Активных change нет", file=sys.stderr)
+        for name in names:
             print(name)
         return 0
     if not args.change:
@@ -297,7 +351,13 @@ def main():
     if change_dir is None:
         print(f"Change не найден: {args.change}", file=sys.stderr)
         return 2
-    json.dump(parse_change(change_dir), sys.stdout, ensure_ascii=False, indent=2)
+    parsed = parse_change(change_dir)
+    if args.save_baseline:
+        bp = baseline_path(change_dir)
+        bp.parent.mkdir(parents=True, exist_ok=True)
+        bp.write_text(json.dumps({"path": str(Path(change_dir).resolve()), "files": file_hashes(parsed)}, ensure_ascii=False, indent=2), encoding="utf-8")
+        parsed["baseline"] = str(bp)
+    json.dump(parsed, sys.stdout, ensure_ascii=False, indent=2)
     print()
     return 0
 
